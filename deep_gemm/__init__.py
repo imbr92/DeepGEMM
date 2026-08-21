@@ -82,6 +82,13 @@ except ImportError:
     # Expected behavior for CUDA runtime version before 12.1
     pass
 
+# Shape-local grouped backward policy
+from .grouped import (
+    BF16GroupedAlignmentPolicy,
+    get_bf16_grouped_alignment,
+    k_grouped_bf16_wgrad_tn_contiguous,
+)
+
 # Mega kernels
 from .mega import (
     MegaMoECapability,

@@ -47,3 +47,27 @@ def test_k_grouped_bf16_alignment_is_per_call(alignment: int) -> None:
         assert calc_diff(d, reference) < 1e-5
     finally:
         deep_gemm.set_mk_alignment_for_contiguous_layout(old_alignment)
+
+
+@pytest.mark.parametrize(
+    ("real_ks", "layout_alignment", "expected_alignment"),
+    [([1, 8, 16, 32], 32, 32), ([65, 65, 65, 65], 224, 224)],
+)
+def test_fp32_wgrad_wrapper_uses_shape_policy(
+    real_ks: list[int],
+    layout_alignment: int,
+    expected_alignment: int,
+) -> None:
+    _, a, b, c, d, reference, grouped_layout, _ = (
+        generate_k_grouped_contiguous_psum(
+            4, 128, 128,
+            MajorTypeAB.MNMajor, MajorTypeAB.MNMajor,
+            real_ks, layout_alignment,
+            use_bf16=True, gran_k=layout_alignment,
+        )
+    )
+    policy = deep_gemm.k_grouped_bf16_wgrad_tn_contiguous(
+        a, b, d, None, grouped_layout, c,
+        route_tokens=sum(real_ks), max_tokens_per_group=max(real_ks))
+    assert policy.alignment == expected_alignment
+    assert calc_diff(d, reference) < 1e-5
