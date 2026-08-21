@@ -25,6 +25,9 @@ struct GemmDesc {
     // SM100 m-grouped psum layout padding contract
     bool ensure_zero_padding = true;
 
+    // Per-call M/K-grouped padding alignment. Zero preserves the legacy global default.
+    int grouped_alignment = 0;
+
     // Shape for heuristic generation
     int expected_m = 0, expected_n = 0, expected_k = 0, expected_num_groups = 0;
     int get_expected_m() const { return expected_m > 0 ? expected_m : m; }
@@ -64,6 +67,7 @@ struct GemmDesc {
            << ", tc_util=" << desc.tc_util
            << ", compiled_dims=" << desc.compiled_dims
            << ", ensure_zero_padding=" << static_cast<int>(desc.ensure_zero_padding)
+           << ", grouped_alignment=" << desc.grouped_alignment
            << ", expected_m=" << desc.expected_m
            << ", expected_n=" << desc.expected_n
            << ", expected_k=" << desc.expected_k

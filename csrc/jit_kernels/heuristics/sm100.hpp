@@ -34,7 +34,9 @@ struct SM100ArchSpec {
             desc.gemm_type == GemmType::MGroupedMasked) {
             const bool swap_ab = true;
             const auto block_n = 128;
-            const auto block_m = heuristics_runtime->get_mk_alignment_for_contiguous_layout();
+            const auto block_m = desc.grouped_alignment > 0 ?
+                desc.grouped_alignment :
+                heuristics_runtime->get_mk_alignment_for_contiguous_layout();
             const auto cluster_m = 1;
             const auto cluster_n = ceil_div(desc.n, block_n) % 2 == 0 and desc.num_sms % 2 == 0 ? 2 : 1;
             const auto layout = Layout{swap_ab, block_m, block_n, block_k, cluster_m, cluster_n};

@@ -466,7 +466,8 @@ static void m_grouped_bf16_gemm_nt_contiguous(const torch::Tensor& a, const torc
                                               const std::string& compiled_dims,
                                               const bool& use_psum_layout,
                                               const bool& ensure_zero_padding,
-                                              const std::optional<int>& expected_m_for_psum_layout) {
+                                              const std::optional<int>& expected_m_for_psum_layout,
+                                              const std::optional<int>& alignment) {
     // Shape must be `[M, K] @ [G, N, K].mT`
     const auto major_a = get_major_type_ab(a);
     const auto major_b = get_major_type_ab(b);
@@ -493,6 +494,10 @@ static void m_grouped_bf16_gemm_nt_contiguous(const torch::Tensor& a, const torc
         DG_HOST_ASSERT(m == m__);
         DG_HOST_ASSERT(not expected_m_for_psum_layout.has_value());
     }
+    const auto grouped_alignment =
+        alignment.value_or(heuristics_runtime->get_mk_alignment_for_contiguous_layout());
+    DG_HOST_ASSERT(grouped_alignment >= 32 and grouped_alignment <= 224);
+    DG_HOST_ASSERT(grouped_alignment % 32 == 0);
 
     // D must be N-major
     check_major_type_cd(d);
@@ -504,13 +509,14 @@ static void m_grouped_bf16_gemm_nt_contiguous(const torch::Tensor& a, const torc
     // Dispatch implementation
     const auto arch_major = device_runtime->get_arch_major();
     if (arch_major == 9) {
+        DG_HOST_ASSERT(not alignment.has_value());
         sm90_m_grouped_bf16_gemm_contiguous(a, b, d, grouped_layout,
                                             num_groups, m, n, k, major_a, major_b, compiled_dims,
                                             use_psum_layout, expected_m_for_psum_layout);
     } else if (arch_major == 10) {
         sm100_m_grouped_bf16_gemm_contiguous(a, b, d, grouped_layout,
                                              num_groups, m, n, k, major_a, major_b, compiled_dims,
-                                             use_psum_layout, ensure_zero_padding, expected_m_for_psum_layout);
+                                             use_psum_layout, ensure_zero_padding, expected_m_for_psum_layout, grouped_alignment);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -520,9 +526,10 @@ static void m_grouped_bf16_gemm_nn_contiguous(const torch::Tensor& a, const torc
                                               const torch::Tensor& d, const torch::Tensor& grouped_layout,
                                               const std::string& compiled_dims,
                                               const bool& use_psum_layout,
-                                              const bool& ensure_zero_padding) {
+                                              const bool& ensure_zero_padding,
+                                              const std::optional<int>& alignment) {
     m_grouped_bf16_gemm_nt_contiguous(a, b.transpose(1, 2),
-                                      d, grouped_layout, compiled_dims, use_psum_layout, ensure_zero_padding, std::nullopt);
+                                      d, grouped_layout, compiled_dims, use_psum_layout, ensure_zero_padding, std::nullopt, alignment);
 }
 
 static void m_grouped_bf16_gemm_nt_masked(const torch::Tensor& a, const torch::Tensor& b,
@@ -570,14 +577,16 @@ static void k_grouped_bf16_gemm_tn_contiguous(const torch::Tensor& a,
                                               const torch::Tensor& grouped_layout,
                                               const std::optional<torch::Tensor>& c,
                                               const std::string& compiled_dims,
-                                              const bool& use_psum_layout) {
+                                              const bool& use_psum_layout,
+                                              const std::optional<int>& alignment) {
     // Shape checks
     const auto [num_groups, m, n] = get_shape<3>(d);
     const auto [sum_k_ , m_] = get_shape<2>(a);
     const auto [sum_k__, n_] = get_shape<2>(b);
 
-    const auto k_alignment = heuristics_runtime->get_mk_alignment_for_contiguous_layout();
+    const auto k_alignment = alignment.value_or(heuristics_runtime->get_mk_alignment_for_contiguous_layout());
     DG_HOST_ASSERT(k_alignment % 32 == 0);
+    DG_HOST_ASSERT(k_alignment >= 32 and k_alignment <= 224);
     const int sum_k = check_k_grouped_args(ks_cpu, grouped_layout, num_groups,
                                            use_psum_layout, k_alignment, static_cast<int>(a.size(0)));
     DG_HOST_ASSERT(m == m_ and n == n_ and sum_k == sum_k_ and sum_k == sum_k__);
@@ -597,11 +606,12 @@ static void k_grouped_bf16_gemm_tn_contiguous(const torch::Tensor& a,
     if (arch_major == 9) {
         // No psum on SM90
         DG_HOST_ASSERT(not use_psum_layout and ks_cpu.has_value() and not ks_cpu.value().empty());
+        DG_HOST_ASSERT(not alignment.has_value());
         sm90_bf16_k_grouped_gemm(a, b, c, d, m, n, ks_cpu.value(), grouped_layout,
                                  cute::UMMA::Major::MN, cute::UMMA::Major::MN, compiled_dims);
     } else if (arch_major == 10) {
         sm100_bf16_k_grouped_gemm(a, b, c, d, m, n, grouped_layout,
-                                  cute::UMMA::Major::MN, cute::UMMA::Major::MN, compiled_dims, use_psum_layout);
+                                  cute::UMMA::Major::MN, cute::UMMA::Major::MN, compiled_dims, use_psum_layout, k_alignment);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -740,12 +750,14 @@ static void register_apis(pybind11::module_& m) {
           py::arg("compiled_dims") = "nk",
           py::arg("use_psum_layout") = false,
           py::arg("ensure_zero_padding") = true,
-          py::arg("expected_m_for_psum_layout") = std::nullopt);
+          py::arg("expected_m_for_psum_layout") = std::nullopt,
+          py::arg("alignment") = std::nullopt);
     m.def("m_grouped_bf16_gemm_nn_contiguous", &m_grouped_bf16_gemm_nn_contiguous,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("grouped_layout"),
           py::arg("compiled_dims") = "nk",
           py::arg("use_psum_layout") = false,
-          py::arg("ensure_zero_padding") = true);
+          py::arg("ensure_zero_padding") = true,
+          py::arg("alignment") = std::nullopt);
     m.def("m_grouped_bf16_gemm_nt_masked", &m_grouped_bf16_gemm_nt_masked,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("masked_m"),
           py::arg("expected_m"), py::arg("compiled_dims") = "nk");
@@ -754,7 +766,8 @@ static void register_apis(pybind11::module_& m) {
           py::arg("ks_cpu"), py::arg("grouped_layout"),
           py::arg("c") = std::nullopt,
           py::arg("compiled_dims") = "mn",
-          py::arg("use_psum_layout") = false);
+          py::arg("use_psum_layout") = false,
+          py::arg("alignment") = std::nullopt);
 #endif
 
     // cuBLASLt GEMMs
