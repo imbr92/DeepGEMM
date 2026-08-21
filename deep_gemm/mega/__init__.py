@@ -171,7 +171,8 @@ class SymmBuffer:
          self.l1_acts, self.l1_acts_sf,
          self.l2_acts, self.l2_acts_sf) = slice_input_buffers(self.buffer)
         assert self.l1_acts.shape[0] == self.spec.num_ring_tokens
-        assert (self.l1_acts_sf.numel() == 0) == (self.spec.num_sf_ring_tokens == 0)
+        has_sf_ring = self.l1_acts_sf is not None and self.l1_acts_sf.numel() > 0
+        assert has_sf_ring == (self.spec.num_sf_ring_tokens > 0)
 
     def destroy(self):
         self.handle = None

@@ -4,6 +4,7 @@ import random
 import sys
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from typing import Optional, Tuple
 
 import deep_gemm
@@ -70,6 +71,41 @@ def _copy_fp8_sf(dst: torch.Tensor, src: torch.Tensor, num_tokens: int) -> None:
         dst[num_tokens:].copy_(src[-1:].expand(dst.shape[0] - num_tokens, -1))
 
 
+def make_test_routes(num_tokens: int,
+                     num_topk: int,
+                     num_experts: int,
+                     num_ranks: int,
+                     source_rank: int,
+                     pattern: str,
+                     skew_factor: float,
+                     skew_rank: int,
+                     device: torch.device) -> torch.Tensor:
+    assert pattern in ('balanced', 'skew')
+    assert 1 <= skew_factor <= num_ranks
+    assert 0 <= skew_rank < num_ranks
+    assert num_experts % num_ranks == 0
+    num_experts_per_rank = num_experts // num_ranks
+    token_offsets = torch.arange(num_tokens, dtype=torch.long, device=device)
+    token_offsets = token_offsets + source_rank * num_tokens
+    topk_offsets = torch.arange(num_topk, dtype=torch.long, device=device)
+    route_offsets = token_offsets[:, None] + topk_offsets[None, :]
+    destination_ranks = route_offsets.remainder(num_ranks)
+    local_experts = route_offsets.remainder(num_experts_per_rank)
+    balanced = destination_ranks * num_experts_per_rank + local_experts
+    if pattern == 'balanced' or skew_factor == 1:
+        return balanced
+
+    # Convert an exact number of non-target routes. Balanced routing contributes
+    # total_routes / EP to the target; adding (factor - 1) times that amount
+    # makes its final load exactly factor times the balanced per-rank load.
+    non_target = destination_ranks != skew_rank
+    non_target_ordinal = non_target.flatten().cumsum(0).reshape_as(non_target)
+    num_forced = round((skew_factor - 1) * num_tokens * num_topk / num_ranks)
+    force_mask = non_target & (non_target_ordinal <= num_forced)
+    forced = skew_rank * num_experts_per_rank + local_experts
+    return torch.where(force_mask, forced, balanced)
+
+
 # TODO: skip the test for SM90
 # noinspection PyUnboundLocalVariable,PyShadowingNames
 def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
@@ -121,8 +157,14 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             (num_experts_per_rank, intermediate_hidden * 2, hidden), dtype=torch.bfloat16, device='cuda')
         l2_weights = torch.randn(
             (num_experts_per_rank, hidden, intermediate_hidden), dtype=torch.bfloat16, device='cuda')
-        scores = torch.randn((num_tokens, num_experts), dtype=torch.float, device='cuda')
-        topk_weights, topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=False)
+        if args.routing_pattern == 'random':
+            scores = torch.randn((num_tokens, num_experts), dtype=torch.float, device='cuda')
+            topk_weights, topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=False)
+        else:
+            topk_idx = make_test_routes(
+                num_tokens, num_topk, num_experts, num_ranks, rank_idx,
+                args.routing_pattern, args.skew_factor, args.skew_rank, torch.device('cuda'))
+            topk_weights = torch.randn((num_tokens, num_topk), dtype=torch.float, device='cuda')
         cumulative_local_expert_recv_stats_fused = torch.randint(
             0, 100, (num_experts_per_rank, ), dtype=torch.int, device='cuda')
         cumulative_local_expert_recv_stats_baseline = cumulative_local_expert_recv_stats_fused.clone()
@@ -197,6 +239,65 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         (deep_gemm.bf16_mega_moe if is_bf16xbf16 else deep_gemm.fp8_fp4_mega_moe)(**kernel_kwargs)
         return y, cumulative_local_expert_recv_stats_fused
 
+    def run_torch_reference():
+        assert is_bf16xbf16
+        all_x = uneven_all_gather(x, group=group)
+        all_topk_idx = uneven_all_gather(topk_idx, group=group)
+        all_topk_weights = uneven_all_gather(topk_weights, group=group)
+        local_num_tokens = torch.tensor([num_tokens], dtype=torch.long, device='cuda')
+        gathered_num_tokens = [torch.empty_like(local_num_tokens) for _ in range(num_ranks)]
+        dist.all_gather(gathered_num_tokens, local_num_tokens, group=group)
+        num_tokens_by_rank = [value.item() for value in gathered_num_tokens]
+        source_start = sum(num_tokens_by_rank[:rank_idx])
+
+        routed_y = torch.zeros_like(all_x)
+        local_expert_start = rank_idx * num_experts_per_rank
+        local_route_mask = (
+            (all_topk_idx >= local_expert_start) &
+            (all_topk_idx < local_expert_start + num_experts_per_rank)
+        )
+        local_recv_counts = torch.zeros(
+            num_experts_per_rank, dtype=torch.int, device='cuda')
+        for local_expert_idx in range(num_experts_per_rank):
+            global_expert_idx = local_expert_start + local_expert_idx
+            route_locations = (all_topk_idx == global_expert_idx).nonzero()
+            local_recv_counts[local_expert_idx] = route_locations.shape[0]
+            if route_locations.shape[0] == 0:
+                continue
+            token_idx, topk_slot = route_locations.unbind(dim=1)
+            l1 = F.linear(all_x[token_idx], l1_weights[local_expert_idx])
+            gate, up = l1.chunk(2, dim=-1)
+            if args.activation_clamp is not None:
+                gate = torch.minimum(gate, torch.full_like(gate, args.activation_clamp))
+                up = torch.clamp(up, -args.activation_clamp, args.activation_clamp)
+            gate_fp32 = gate.float()
+            activated = (
+                gate_fp32 / (1 + torch.exp(-gate_fp32)) *
+                up.float() * all_topk_weights[token_idx, topk_slot, None]
+            ).to(torch.bfloat16)
+            routed_y.index_add_(
+                0, token_idx, F.linear(activated, l2_weights[local_expert_idx]))
+        dist.all_reduce(routed_y, group=group)
+
+        source_y = routed_y[source_start:source_start + num_tokens]
+        if num_shared_experts > 0:
+            shared_l1 = F.linear(x, shared_l1_weights)
+            shared_gate, shared_up = shared_l1.chunk(2, dim=-1)
+            if args.activation_clamp is not None:
+                shared_gate = torch.minimum(
+                    shared_gate, torch.full_like(shared_gate, args.activation_clamp))
+                shared_up = torch.clamp(
+                    shared_up, -args.activation_clamp, args.activation_clamp)
+            shared_gate_fp32 = shared_gate.float()
+            shared_activated = (
+                shared_gate_fp32 / (1 + torch.exp(-shared_gate_fp32)) *
+                shared_up.float()
+            ).to(torch.bfloat16)
+            source_y = source_y + F.linear(shared_activated, shared_l2_weights)
+        expected_stats = initial_cumulative_local_expert_recv_stats_baseline + local_recv_counts
+        assert local_route_mask.sum() == local_recv_counts.sum()
+        return source_y, expected_stats
+
     dist_print('Config:', once_in_node=True)
     dist_print(f' > MMA: {args.mma_type}', once_in_node=True)
     dist_print(f' > Tokens: {num_tokens}/{num_max_tokens_per_rank}', once_in_node=True)
@@ -204,6 +305,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     dist_print(f' > Intermediate: {intermediate_hidden}', once_in_node=True)
     dist_print(f' > Shared experts: {num_shared_experts}', once_in_node=True)
     dist_print(f' > Experts: {num_topk}/{num_experts}', once_in_node=True)
+    dist_print(f' > Routing: {args.routing_pattern}, skew={args.skew_factor:g}x '
+               f'to rank {args.skew_rank}', once_in_node=True)
     dist_print(f' > Buffer: {buffer.buffer.nbytes / 2 ** 30:.3f} GiB', once_in_node=True)
     dist_print(once_in_node=True)
 
@@ -327,6 +430,19 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             if (i + 1) % 100 == 0 or i == num_correctness_tests - 1:
                 dist_print(f' > Correctness test #{i + 1}/{num_correctness_tests} passed', once_in_node=True)
         dist_print(once_in_node=True)
+    elif is_bf16xbf16 and num_correctness_tests > 0:
+        dist_print('Running independent PyTorch correctness tests:', once_in_node=True)
+        for i in range(num_correctness_tests):
+            create_inputs()
+            fused_y, fused_stats = run_fused()
+            reference_y, reference_stats = run_torch_reference()
+            assert torch.equal(fused_stats, reference_stats)
+            diff = calc_diff(fused_y, reference_y)
+            assert diff < 2e-4, f'PyTorch reference diff is {diff}'
+            if (i + 1) % 100 == 0 or i == num_correctness_tests - 1:
+                dist_print(f' > Correctness test #{i + 1}/{num_correctness_tests} passed '
+                           f'(diff={diff:.3g})', once_in_node=True)
+        dist_print(once_in_node=True)
     else:
         create_inputs()
 
@@ -423,6 +539,12 @@ if __name__ == '__main__':
     parser.add_argument('--masked-ratio', type=float, default=0.0, help='Mask some expert selections')
     parser.add_argument('--fast-math', type=int, default=1, help='Enable fast math (0 or 1, default: 1)')
     parser.add_argument('--mma-type', type=str, default='fp8xfp4', help='MMA type: fp8xfp4 or bf16xbf16')
+    parser.add_argument('--routing-pattern', choices=('random', 'balanced', 'skew'), default='random',
+                        help='Synthetic routing distribution')
+    parser.add_argument('--skew-factor', type=float, default=1,
+                        help='Target-rank load factor for --routing-pattern=skew (1..EP)')
+    parser.add_argument('--skew-rank', type=int, default=0,
+                        help='Target rank for --routing-pattern=skew')
 
     # Test settings
     parser.add_argument('--num-correctness-tests', type=int, default=None, help='Pressure test')
