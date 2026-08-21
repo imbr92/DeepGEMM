@@ -1,7 +1,9 @@
 import torch
 import types
 import warnings
+from dataclasses import dataclass
 from typing import Tuple, Optional, Union
+
 from ..utils.math import align
 
 # noinspection PyBroadException
@@ -13,6 +15,109 @@ except Exception as exception:
     print(f'Failed to load mega kernels, please check your PyTorch version: {exception}')
 
 from .. import _C
+
+
+@dataclass(frozen=True)
+class MegaMoECapability:
+    supported: bool
+    reason: str = ''
+
+    def require(self) -> None:
+        if not self.supported:
+            raise ValueError(self.reason)
+
+
+@dataclass(frozen=True)
+class MegaMoEWorkspaceSpec:
+    num_ranks: int
+    num_experts: int
+    requested_max_tokens_per_rank: int
+    num_max_tokens_per_rank: int
+    num_topk: int
+    hidden: int
+    intermediate_hidden: int
+    num_shared_experts: int
+    mma_type: str
+    activation: str
+    token_alignment: int
+    num_ring_tokens: int
+    num_sf_ring_tokens: int
+    num_bytes: int
+
+
+def get_mega_moe_capability(num_ranks: int,
+                            num_experts: int,
+                            num_max_tokens_per_rank: int,
+                            num_topk: int,
+                            hidden: int,
+                            intermediate_hidden: int,
+                            num_shared_experts: int = 0,
+                            mma_type: str = 'fp8xfp4',
+                            activation: str = 'swiglu',
+                            device: Optional[Union[torch.device, str, int]] = None) -> MegaMoECapability:
+    if num_ranks <= 0:
+        return MegaMoECapability(False, f'num_ranks must be positive, got {num_ranks}')
+    if num_experts <= 0 or num_experts % num_ranks != 0:
+        return MegaMoECapability(
+            False, f'num_experts ({num_experts}) must be positive and divisible by num_ranks ({num_ranks})')
+    if num_max_tokens_per_rank < 0:
+        return MegaMoECapability(
+            False, f'num_max_tokens_per_rank must be non-negative, got {num_max_tokens_per_rank}')
+    if num_topk <= 0 or num_topk > num_experts:
+        return MegaMoECapability(False, f'num_topk must be in [1, {num_experts}], got {num_topk}')
+    if hidden <= 0 or intermediate_hidden <= 0:
+        return MegaMoECapability(
+            False, f'hidden sizes must be positive, got hidden={hidden}, intermediate_hidden={intermediate_hidden}')
+    if num_shared_experts < 0:
+        return MegaMoECapability(False, f'num_shared_experts must be non-negative, got {num_shared_experts}')
+    if mma_type not in ('bf16xbf16', 'fp8xfp4'):
+        return MegaMoECapability(False, f'unsupported mma_type {mma_type!r}')
+    if activation != 'swiglu':
+        return MegaMoECapability(False, f'unsupported activation {activation!r}; only swiglu is supported')
+    if mma_type == 'fp8xfp4' and (
+            hidden % 128 != 0 or intermediate_hidden % 128 != 0 or
+            (num_shared_experts > 0 and intermediate_hidden * num_shared_experts % 128 != 0)):
+        return MegaMoECapability(
+            False, 'fp8xfp4 requires hidden, intermediate, and shared intermediate sizes divisible by 128')
+
+    if device is not None:
+        device = torch.device(device)
+        if device.type != 'cuda':
+            return MegaMoECapability(False, f'Mega-MoE requires CUDA, got {device}')
+        if not torch.cuda.is_available():
+            return MegaMoECapability(False, 'Mega-MoE requires an available CUDA device')
+        if torch.cuda.get_device_capability(device)[0] != 10:
+            return MegaMoECapability(
+                False, f'Mega-MoE requires an SM100-family GPU, got capability {torch.cuda.get_device_capability(device)}')
+    return MegaMoECapability(True)
+
+
+def get_mega_moe_workspace_spec(num_ranks: int,
+                                num_experts: int,
+                                num_max_tokens_per_rank: int,
+                                num_topk: int,
+                                hidden: int,
+                                intermediate_hidden: int,
+                                num_shared_experts: int = 0,
+                                mma_type: str = 'fp8xfp4',
+                                activation: str = 'swiglu') -> MegaMoEWorkspaceSpec:
+    capability = get_mega_moe_capability(
+        num_ranks, num_experts, num_max_tokens_per_rank, num_topk,
+        hidden, intermediate_hidden, num_shared_experts, mma_type, activation)
+    capability.require()
+    token_alignment = _C.get_token_alignment_for_mega_moe()
+    aligned_tokens = align(num_max_tokens_per_rank, token_alignment)
+    num_bytes, num_ring_tokens, num_sf_ring_tokens = _C.get_symm_buffer_metadata_for_mega_moe(
+        num_ranks, num_experts, aligned_tokens, num_topk, hidden, intermediate_hidden,
+        mma_type, activation, num_shared_experts)
+    return MegaMoEWorkspaceSpec(
+        num_ranks=num_ranks, num_experts=num_experts,
+        requested_max_tokens_per_rank=num_max_tokens_per_rank,
+        num_max_tokens_per_rank=aligned_tokens, num_topk=num_topk,
+        hidden=hidden, intermediate_hidden=intermediate_hidden,
+        num_shared_experts=num_shared_experts, mma_type=mma_type, activation=activation,
+        token_alignment=token_alignment, num_ring_tokens=num_ring_tokens,
+        num_sf_ring_tokens=num_sf_ring_tokens, num_bytes=num_bytes)
 
 
 class SymmBuffer:
@@ -30,17 +135,25 @@ class SymmBuffer:
         self.num_topk = num_topk
         self.hidden = hidden
         self.intermediate_hidden = intermediate_hidden
+        self.num_shared_experts = num_shared_experts
+        self.mma_type = mma_type
+        self.activation = activation
+
+        self.spec = get_mega_moe_workspace_spec(
+            group.size(), num_experts, num_max_tokens_per_rank, num_topk,
+            hidden, intermediate_hidden, num_shared_experts, mma_type, activation)
+        assert self.spec.num_max_tokens_per_rank == num_max_tokens_per_rank
 
         # Allocate a symmetric buffer
         num_bytes, slice_input_buffers = _C.get_symm_buffer_size_for_mega_moe(
             group.size(), num_experts,
             num_max_tokens_per_rank, num_topk,
             hidden, intermediate_hidden,
-            mma_type, activation,
-            num_shared_experts
+            mma_type, activation, num_shared_experts
         )
+        assert num_bytes == self.spec.num_bytes
         allocator = torch if group.size() == 1 else symm_mem
-        self.buffer = allocator.empty(num_bytes, dtype=torch.int8, device='cuda')
+        self.buffer = allocator.empty(self.spec.num_bytes, dtype=torch.int8, device='cuda')
         self.handle = (
             types.SimpleNamespace(buffer_ptrs=[self.buffer.data_ptr()])
             if group.size() == 1
@@ -57,6 +170,8 @@ class SymmBuffer:
          self.shared_l2_acts, self.shared_l2_acts_sf,
          self.l1_acts, self.l1_acts_sf,
          self.l2_acts, self.l2_acts_sf) = slice_input_buffers(self.buffer)
+        assert self.l1_acts.shape[0] == self.spec.num_ring_tokens
+        assert (self.l1_acts_sf.numel() == 0) == (self.spec.num_sf_ring_tokens == 0)
 
     def destroy(self):
         self.handle = None

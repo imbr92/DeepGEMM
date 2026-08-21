@@ -84,7 +84,11 @@ except ImportError:
 
 # Mega kernels
 from .mega import (
+    MegaMoECapability,
+    MegaMoEWorkspaceSpec,
     SymmBuffer,
+    get_mega_moe_capability,
+    get_mega_moe_workspace_spec,
     get_symm_buffer_for_mega_moe,
     transform_weights_for_mega_moe,
     fp8_fp4_mega_moe,

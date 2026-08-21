@@ -154,6 +154,37 @@ get_symm_buffer_size_for_mega_moe(
     return {mega_buffer.get_num_bytes(), slice_input_buffers};
 }
 
+static std::tuple<int64_t, int, int> get_symm_buffer_metadata_for_mega_moe(
+    const int& num_ranks, const int& num_experts,
+    const int& num_max_tokens_per_rank, const int& num_topk,
+    const int& hidden, const int& intermediate_hidden,
+    const std::string& mma_type, const std::string& activation,
+    const int& num_shared_experts = 0) {
+    const auto [num_bytes, _slice] = get_symm_buffer_size_for_mega_moe(
+        num_ranks, num_experts, num_max_tokens_per_rank, num_topk,
+        hidden, intermediate_hidden, mma_type, activation, num_shared_experts);
+    const auto num_sms = device_runtime->get_num_sms();
+    const auto num_experts_per_rank = num_experts / num_ranks;
+    const auto num_active_topk = std::min(num_topk, num_experts_per_rank);
+    const auto num_max_routed_tokens = num_max_tokens_per_rank * num_ranks * num_active_topk;
+    int num_ring_tokens = 0;
+    for (const auto& block_m: layout::kCandidateBlockM) {
+        const auto num_pool_blocks = ceil_div(num_max_routed_tokens, block_m) + num_experts_per_rank;
+        const auto num_live_pool_blocks = sched::get_num_max_live_pool_blocks(
+            num_pool_blocks, num_sms, hidden, intermediate_hidden);
+        num_ring_tokens = std::max(num_ring_tokens, num_live_pool_blocks * block_m);
+    }
+    num_ring_tokens = math::align(num_ring_tokens, layout::kLCMCandidateBlockM);
+
+    int num_sf_ring_tokens = 0;
+    if (is_mma_with_sf(parse_mma_kind(mma_type))) {
+        for (const auto& block_m: layout::kCandidateBlockM)
+            num_sf_ring_tokens = std::max(
+                num_sf_ring_tokens, layout::get_num_sf_ring_tokens(num_ring_tokens, block_m));
+    }
+    return {num_bytes, num_ring_tokens, num_sf_ring_tokens};
+}
+
 static void fp8_fp4_mega_moe(
     const torch::Tensor& y,
     const std::tuple<torch::Tensor, torch::Tensor>& l1_weights_tuple,
@@ -398,6 +429,7 @@ static void register_apis(pybind11::module_& m) {
     m.def("get_token_alignment_for_mega_moe", &get_token_alignment_for_mega_moe);
     m.def("get_block_m_for_mega_moe", &get_block_m_for_mega_moe);
     m.def("get_symm_buffer_size_for_mega_moe", &get_symm_buffer_size_for_mega_moe);
+    m.def("get_symm_buffer_metadata_for_mega_moe", &get_symm_buffer_metadata_for_mega_moe);
     m.def("fp8_fp4_mega_moe", &fp8_fp4_mega_moe);
     m.def("bf16_mega_moe", &bf16_mega_moe);
 #endif
