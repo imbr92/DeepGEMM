@@ -2,7 +2,7 @@ import torch
 import types
 import warnings
 from dataclasses import dataclass
-from typing import Tuple, Optional, Union
+from typing import Optional, Sequence, Tuple, Union
 
 from ..utils.math import align
 
@@ -15,6 +15,9 @@ except Exception as exception:
     print(f'Failed to load mega kernels, please check your PyTorch version: {exception}')
 
 from .. import _C
+
+
+_WORKSPACE_ALIGNMENT = 16
 
 
 @dataclass(frozen=True)
@@ -127,7 +130,9 @@ class SymmBuffer:
                  hidden: int, intermediate_hidden: int,
                  num_shared_experts: int = 0,
                  mma_type: str = 'fp8xfp4',
-                 activation: str = 'swiglu'):
+                 activation: str = 'swiglu',
+                 buffer: Optional[torch.Tensor] = None,
+                 buffer_ptrs: Optional[Sequence[int]] = None):
         assert activation == 'swiglu', f'Only `swiglu` activation is supported, got `{activation}`'
         self.group = group
         self.num_experts = num_experts
@@ -144,7 +149,10 @@ class SymmBuffer:
             hidden, intermediate_hidden, num_shared_experts, mma_type, activation)
         assert self.spec.num_max_tokens_per_rank == num_max_tokens_per_rank
 
-        # Allocate a symmetric buffer
+        # Allocate a symmetric buffer, or wrap a caller-owned slice of a
+        # symmetric arena. The kernel only consumes the local tensor and the
+        # process-group-ordered peer pointers; it does not depend on the
+        # allocator that produced them.
         num_bytes, slice_input_buffers = _C.get_symm_buffer_size_for_mega_moe(
             group.size(), num_experts,
             num_max_tokens_per_rank, num_topk,
@@ -152,13 +160,38 @@ class SymmBuffer:
             mma_type, activation, num_shared_experts
         )
         assert num_bytes == self.spec.num_bytes
-        allocator = torch if group.size() == 1 else symm_mem
-        self.buffer = allocator.empty(self.spec.num_bytes, dtype=torch.int8, device='cuda')
-        self.handle = (
-            types.SimpleNamespace(buffer_ptrs=[self.buffer.data_ptr()])
-            if group.size() == 1
-            else symm_mem.rendezvous(self.buffer, group=group)
-        )
+        if (buffer is None) != (buffer_ptrs is None):
+            raise ValueError('buffer and buffer_ptrs must be provided together')
+
+        self.owns_buffer = buffer is None
+        if buffer is None:
+            allocator = torch if group.size() == 1 else symm_mem
+            self.buffer = allocator.empty(self.spec.num_bytes, dtype=torch.int8, device='cuda')
+            self.handle = (
+                types.SimpleNamespace(buffer_ptrs=[self.buffer.data_ptr()])
+                if group.size() == 1
+                else symm_mem.rendezvous(self.buffer, group=group)
+            )
+        else:
+            if not buffer.is_cuda or not buffer.is_contiguous() or buffer.element_size() != 1:
+                raise ValueError('caller-owned Mega-MoE buffer must be a contiguous one-byte CUDA tensor')
+            if buffer.nbytes < self.spec.num_bytes:
+                raise ValueError(
+                    f'caller-owned Mega-MoE buffer has {buffer.nbytes} bytes, '
+                    f'but {self.spec.num_bytes} bytes are required')
+            pointers = [int(pointer) for pointer in buffer_ptrs]
+            if len(pointers) != group.size():
+                raise ValueError(
+                    f'expected {group.size()} process-group-ordered buffer pointers, got {len(pointers)}')
+            if any(pointer <= 0 or pointer % _WORKSPACE_ALIGNMENT for pointer in pointers):
+                raise ValueError(
+                    f'caller-owned Mega-MoE buffer pointers must be positive and '
+                    f'{_WORKSPACE_ALIGNMENT}-byte aligned')
+            if pointers[group.rank()] != buffer.data_ptr():
+                raise ValueError(
+                    'caller-owned Mega-MoE local buffer pointer does not match buffer_ptrs[group.rank()]')
+            self.buffer = buffer.flatten()[:self.spec.num_bytes]
+            self.handle = types.SimpleNamespace(buffer_ptrs=pointers)
         self.buffer.zero_()
         self.group.barrier()
         torch.cuda.synchronize()
@@ -189,7 +222,15 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
                                  num_shared_experts: int = 0,
                                  use_fp8_dispatch: Union[bool, None] = None,
                                  mma_type: str = 'fp8xfp4',
-                                 activation: str = 'swiglu') -> SymmBuffer:
+                                 activation: str = 'swiglu',
+                                 buffer: Optional[torch.Tensor] = None,
+                                 buffer_ptrs: Optional[Sequence[int]] = None) -> SymmBuffer:
+    """Allocate a workspace or wrap a caller-owned symmetric-arena slice.
+
+    When ``buffer`` is supplied, ``buffer_ptrs`` must contain the base address
+    of the corresponding slice on every process-group rank, in process-group
+    rank order. The caller retains ownership of the backing allocation.
+    """
     # Align token count
     num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe())
 
@@ -206,7 +247,8 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
         num_shared_experts,
-        mma_type=mma_type, activation=activation
+        mma_type=mma_type, activation=activation,
+        buffer=buffer, buffer_ptrs=buffer_ptrs
     )
 
 
