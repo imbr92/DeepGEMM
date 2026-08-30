@@ -74,7 +74,7 @@ static void unload_library(const LibraryHandle& library) {
 
 static LaunchConfigHandle construct_launch_config(const KernelHandle& kernel,
                                                   const cudaStream_t& stream, const int& smem_size,
-                                                  const dim3& grid_dim, const dim3& block_dim, const int& cluster_dim, const bool& enable_pdl) {
+                                                  const dim3& grid_dim, const dim3& block_dim, const int& cluster_dim, const bool& enable_pdl, const bool& cooperative) {
     if (smem_size > 0)
         DG_CUDA_RUNTIME_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
@@ -86,7 +86,7 @@ static LaunchConfigHandle construct_launch_config(const KernelHandle& kernel,
 
     // Create attributes
     // NOTES: must use `static` or the `attr` will be deconstructed
-    static LaunchAttrHandle attrs[2];
+    static LaunchAttrHandle attrs[3];
     config.numAttrs = 0;
     config.attrs = attrs;
 
@@ -97,8 +97,15 @@ static LaunchConfigHandle construct_launch_config(const KernelHandle& kernel,
         attr.val.clusterDim = {static_cast<unsigned>(cluster_dim), 1, 1};
     }
 
-    // Dependent kernel launch
+    // Whole-grid barriers require every block to be concurrently resident.
+    if (cooperative) {
+        auto& attr = attrs[config.numAttrs ++];
+        attr.id = cudaLaunchAttributeCooperative;
+        attr.val.cooperative = 1;
+    }
+
     if (enable_pdl) {
+    // Dependent kernel launch
         auto& attr = attrs[config.numAttrs ++];
         attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
         attr.val.programmaticStreamSerializationAllowed = 1;
@@ -173,7 +180,7 @@ static void unload_library(const LibraryHandle& library) {
 
 static LaunchConfigHandle construct_launch_config(const KernelHandle& kernel,
                                                  const cudaStream_t& stream, const int& smem_size,
-                                                 const dim3& grid_dim, const dim3& block_dim, const int& cluster_dim, const bool& enable_pdl) {
+                                                 const dim3& grid_dim, const dim3& block_dim, const int& cluster_dim, const bool& enable_pdl, const bool& cooperative) {
     if (smem_size > 0)
         DG_CUDA_DRIVER_CHECK(lazy_cuFuncSetAttribute(kernel, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem_size));
 
@@ -189,7 +196,7 @@ static LaunchConfigHandle construct_launch_config(const KernelHandle& kernel,
     
     // Create attributes
     // NOTES: must use `static` or the `attr` will be deconstructed
-    static LaunchAttrHandle attrs[2];
+    static LaunchAttrHandle attrs[3];
     config.numAttrs = 0;
     config.attrs = attrs;
 
@@ -202,8 +209,15 @@ static LaunchConfigHandle construct_launch_config(const KernelHandle& kernel,
         attr.value.clusterDim.z = 1;
     }
 
-    // Dependent kernel launch
+    // Whole-grid barriers require every block to be concurrently resident.
+    if (cooperative) {
+        auto& attr = attrs[config.numAttrs ++];
+        attr.id = CU_LAUNCH_ATTRIBUTE_COOPERATIVE;
+        attr.value.cooperative = 1;
+    }
+
     if (enable_pdl) {
+    // Dependent kernel launch
         auto& attr = attrs[config.numAttrs ++];
         attr.id = CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;
         attr.value.programmaticStreamSerializationAllowed = 1;

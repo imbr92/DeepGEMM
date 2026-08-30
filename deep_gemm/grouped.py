@@ -45,9 +45,9 @@ def k_grouped_bf16_wgrad_tn_contiguous(
     alignment: Optional[int] = None,
     max_tokens_per_group: Optional[int] = None,
 ) -> BF16GroupedAlignmentPolicy:
-    """Run FP32-accumulating BF16 wgrad with a shape-local alignment policy."""
-    if d.dtype != torch.float32:
-        raise ValueError(f"wgrad output must be FP32, got {d.dtype}")
+    """Run FP32-accumulating BF16-input wgrad with a shape-local alignment policy."""
+    if d.dtype not in (torch.bfloat16, torch.float32):
+        raise ValueError(f"wgrad output must be BF16 or FP32, got {d.dtype}")
     policy = get_bf16_grouped_alignment(
         route_tokens, d.shape[0], max_tokens_per_group=max_tokens_per_group)
     selected_alignment = policy.alignment if alignment is None else alignment

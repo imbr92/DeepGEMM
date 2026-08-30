@@ -225,7 +225,7 @@ static void sm100_bf16_mega_moe(
         .tensor_map_shared_l2_weights = tensor_map_shared_l2_weights,
         .launch_args = LaunchArgs(num_sms,
                                   config.num_dispatch_threads + config.num_non_epilogue_threads + config.num_epilogue_threads,
-                                  config.smem_size, 2)
+                                  config.smem_size, 2, false, true)
     };
 
     const auto code = SM100BF16MegaMoERuntime::generate(args);
