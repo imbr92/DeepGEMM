@@ -18,6 +18,7 @@ struct LaunchArgs {
     int cluster_dim;
     bool enable_pdl;
     bool cooperative;
+    bool pdl_is_explicit = false;
 
     LaunchArgs(const int& grid_dim_x, const int& num_threads, const int& smem_size = 0, const int& cluster_dim = 1, const bool& enable_pdl = true, const bool& cooperative = false):
         grid_dim({grid_dim_x, 1}), num_threads(num_threads), smem_size(smem_size), cluster_dim(cluster_dim), enable_pdl(enable_pdl), cooperative(cooperative) {}
@@ -144,7 +145,8 @@ public:
 
         // Allow runtime override from Python.
         // NOTES: the default is enabled.
-        launch_args.enable_pdl = launch_args.enable_pdl and device_runtime->get_pdl();
+        if (!launch_args.pdl_is_explicit)
+            launch_args.enable_pdl = launch_args.enable_pdl and device_runtime->get_pdl();
 
         const dim3 grid_dim = {static_cast<unsigned>(launch_args.grid_dim.first),
                                static_cast<unsigned>(launch_args.grid_dim.second),

@@ -33,6 +33,7 @@ template <
     uint32_t kNumSMs, uint32_t kNumRanks,
     float kActivationClamp,
     bool kFastMath,
+    bool kEnablePDL = false,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -65,6 +66,11 @@ sm100_bf16_mega_moe_impl(void* y,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_acts,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_weights) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
+    if constexpr (kEnablePDL) {
+        static_assert(kNumRanks == 1, "PDL is currently validated only for single-rank MegaMoE");
+        asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+        asm volatile("griddepcontrol.wait;" ::: "memory");
+    }
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = cute::TMEM::Allocator2Sm;
 
