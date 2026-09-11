@@ -25,6 +25,7 @@ public:
         int num_ranks;
         float activation_clamp;
         bool fast_math;
+        bool enable_pdl;
         MegaMoEConfig config;
 
         // Runtime arguments
@@ -69,7 +70,7 @@ static void __instantiate_kernel() {{
         {}, {}, {},
         {}, {},
         {},
-        {}
+        {}, {}
     >);
 }};
 )", args.num_max_tokens_per_rank,
@@ -84,7 +85,8 @@ static void __instantiate_kernel() {{
     args.config.num_dispatch_threads, args.config.num_non_epilogue_threads, args.config.num_epilogue_threads,
     args.launch_args.grid_dim.first, args.num_ranks,
     to_string(args.activation_clamp),
-    args.fast_math ? "true" : "false");
+    args.fast_math ? "true" : "false",
+    args.enable_pdl ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -122,7 +124,8 @@ static void sm100_bf16_mega_moe(
     const int& num_tokens, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
     const float& activation_clamp,
-    const bool& fast_math
+    const bool& fast_math,
+    const bool& enable_pdl
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
@@ -200,7 +203,7 @@ static void sm100_bf16_mega_moe(
 
     // Launch
     const auto num_sms = device_runtime->get_num_sms();
-    const SM100BF16MegaMoERuntime::Args args = {
+    SM100BF16MegaMoERuntime::Args args = {
         .num_max_tokens_per_rank = num_max_tokens_per_rank,
         .hidden = hidden, .intermediate_hidden = intermediate_hidden,
         .num_experts = num_experts, .num_shared_experts = num_shared_experts,
@@ -208,6 +211,7 @@ static void sm100_bf16_mega_moe(
         .num_ranks = num_ranks,
         .activation_clamp = activation_clamp,
         .fast_math = fast_math,
+        .enable_pdl = enable_pdl,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,
@@ -225,9 +229,11 @@ static void sm100_bf16_mega_moe(
         .tensor_map_shared_l2_weights = tensor_map_shared_l2_weights,
         .launch_args = LaunchArgs(num_sms,
                                   config.num_dispatch_threads + config.num_non_epilogue_threads + config.num_epilogue_threads,
-                                  config.smem_size, 2, false, true)
+                                  config.smem_size, 2, enable_pdl, true)
     };
 
+    // The per-call option is explicit and must not mutate global GEMM policy.
+    args.launch_args.pdl_is_explicit = true;
     const auto code = SM100BF16MegaMoERuntime::generate(args);
     const auto runtime = compiler->build("sm100_bf16_mega_moe", code);
     SM100BF16MegaMoERuntime::launch(runtime, args);

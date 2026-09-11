@@ -329,11 +329,13 @@ static void bf16_mega_moe(
     const int& num_experts, const int& num_topk,
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
-    const bool& fast_math
+    const bool& fast_math,
+    const bool& enable_pdl = false
 ) {
     // Config checks
     const auto num_tokens = static_cast<int>(y.size(0));
     DG_HOST_ASSERT(activation == "swiglu");
+    DG_HOST_ASSERT(!enable_pdl || sym_buffer_ptrs.size() == 1);
     DG_HOST_ASSERT(shared_l1_weights_opt.has_value() == shared_l2_weights_opt.has_value());
 
     // Activation checks
@@ -413,7 +415,7 @@ static void bf16_mega_moe(
                             num_shared_experts,
                             num_tokens, num_topk,
                             hidden, intermediate_hidden,
-                            activation_clamp, fast_math);
+                            activation_clamp, fast_math, enable_pdl);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -431,7 +433,15 @@ static void register_apis(pybind11::module_& m) {
     m.def("get_symm_buffer_size_for_mega_moe", &get_symm_buffer_size_for_mega_moe);
     m.def("get_symm_buffer_metadata_for_mega_moe", &get_symm_buffer_metadata_for_mega_moe);
     m.def("fp8_fp4_mega_moe", &fp8_fp4_mega_moe);
-    m.def("bf16_mega_moe", &bf16_mega_moe);
+    m.def("bf16_mega_moe", &bf16_mega_moe,
+          pybind11::arg("y"), pybind11::arg("l1_weights"), pybind11::arg("l2_weights"),
+          pybind11::arg("shared_l1_weights_opt"), pybind11::arg("shared_l2_weights_opt"),
+          pybind11::arg("cumulative_local_expert_recv_stats"), pybind11::arg("sym_buffer"),
+          pybind11::arg("sym_buffer_ptrs"), pybind11::arg("rank_idx"),
+          pybind11::arg("num_max_tokens_per_rank"), pybind11::arg("num_experts"), pybind11::arg("num_topk"),
+          pybind11::arg("activation"), pybind11::arg("activation_clamp_opt"), pybind11::arg("fast_math"),
+          pybind11::arg("enable_pdl") = false);
+    m.attr("supports_bf16_mega_moe_pdl") = true;
 #endif
 }
 
